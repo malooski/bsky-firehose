@@ -1,21 +1,13 @@
-
 {
   "compilerOptions": {
-    "lib": [
-      "ESNext",
-    ],
-    "outDir": "dist",
     "module": "CommonJS",
-    "target": "ES6",
+    "target": "ES2020",
     "esModuleInterop": true,
-    "moduleResolution": "node",
-    "alwaysStrict": true,
-    "allowUnreachableCode": false,
-    "strictNullChecks": true,
-    "skipLibCheck": true
+    "moduleResolution": "Node",
+    "rootDir": "src",
+    "outDir": "dist",
+    "skipLibCheck": true,
   },
-  "include": ["./src/**/*.ts"],
-  "exclude": [
-    "node_modules"
-  ]
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "atproto"]
 }

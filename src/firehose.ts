@@ -1,167 +1,115 @@
 import { Subscription } from "@atproto/xrpc-server";
 import { cborToLexRecord, readCar } from "@atproto/repo";
-import { BlobRef } from "@atproto/lexicon";
-import { ids, lexicons } from "./lexicon/lexicons";
-import { Record as PostRecord } from "./lexicon/types/app/bsky/feed/post";
-import { Record as RepostRecord } from "./lexicon/types/app/bsky/feed/repost";
-import { Record as LikeRecord } from "./lexicon/types/app/bsky/feed/like";
-import { Record as FollowRecord } from "./lexicon/types/app/bsky/graph/follow";
+
 import {
-  Commit,
-  OutputSchema as RepoEvent,
-  isCommit,
-} from "./lexicon/types/com/atproto/sync/subscribeRepos";
-import Delegate from "./delegate";
-import { OperationsByType } from "./types";
+    Commit,
+    RepoOp,
+    isCommit,
+} from "./generated/lexicons/types/com/atproto/sync/subscribeRepos";
+import { delayMs } from "./utils";
+import { ids, lexicons } from "./generated/lexicons/lexicons";
+import { FirehoseEvent } from "./event";
 
+const FEEDGEN_SUBSCRIPTION_ENDPOINT = "wss://bsky.network";
 const DEFAULT_SUBSCRIPTION_RECONNECT_DELAY = 3000;
-const DEFAULT_SERVICE = "wss://bsky.social";
 
-export class Firehose {
-  public sub: Subscription<RepoEvent>;
-
-  public onEvent = new Delegate<RepoEvent>();
-
-  cursor: number | undefined;
-
-  constructor(public service: string = DEFAULT_SERVICE) {
-    this.sub = new Subscription({
-      service: service,
-      method: ids.ComAtprotoSyncSubscribeRepos,
-      getParams: () => ({
-        cursor: this.cursor,
-      }),
-      validate: (value: unknown) => {
-        try {
-          return lexicons.assertValidXrpcMessage<RepoEvent>(
-            ids.ComAtprotoSyncSubscribeRepos,
-            value
-          );
-        } catch (err) {
-          console.error("repo subscription skipped invalid message", err);
-        }
-      },
-    });
-  }
-
-  async run(
-    subscriptionReconnectDelay: number = DEFAULT_SUBSCRIPTION_RECONNECT_DELAY
-  ) {
-    try {
-      for await (const evt of this.sub) {
-        try {
-          await this.onEvent.run(evt);
-        } catch (err) {
-          console.error("repo subscription could not handle message", err);
-        }
-        // update stored cursor every 20 events or so
-        if (isCommit(evt) && evt.seq % 20 === 0) {
-          await this.updateCursor(evt.seq);
-        }
-      }
-    } catch (err) {
-      console.error("repo subscription errored", err);
-      setTimeout(
-        () => this.run(subscriptionReconnectDelay),
-        subscriptionReconnectDelay
-      );
-    }
-  }
-
-  async updateCursor(cursor: number) {
-    this.cursor = cursor;
-  }
+interface FirehoseArgs {
+    service?: string;
+    cursor?: number;
+    reconnectDelayMs?: number;
 }
 
-export const getOpsByType = async (evt: Commit): Promise<OperationsByType> => {
-  const car = await readCar(evt.blocks);
-  const opsByType: OperationsByType = {
-    posts: { creates: [], deletes: [] },
-    reposts: { creates: [], deletes: [] },
-    likes: { creates: [], deletes: [] },
-    follows: { creates: [], deletes: [] },
-  };
+export class Firehose {
+    private _service: string;
+    private _reconnectDelayMs: number;
+    private _stop: boolean = false;
 
-  for (const op of evt.ops) {
-    const uri = `at://${evt.repo}/${op.path}`;
-    const [collection] = op.path.split("/");
+    private _sub: Subscription<Commit>;
 
-    if (op.action === "update") continue; // updates not supported yet
+    private _cursor: number | undefined;
 
-    if (op.action === "create") {
-      if (!op.cid) continue;
-      const recordBytes = car.blocks.get(op.cid);
-      if (!recordBytes) continue;
-      const record = cborToLexRecord(recordBytes);
-      const create = { uri, cid: op.cid.toString(), author: evt.repo };
-      if (collection === ids.AppBskyFeedPost && isPost(record)) {
-        opsByType.posts.creates.push({ record, ...create });
-      } else if (collection === ids.AppBskyFeedRepost && isRepost(record)) {
-        opsByType.reposts.creates.push({ record, ...create });
-      } else if (collection === ids.AppBskyFeedLike && isLike(record)) {
-        opsByType.likes.creates.push({ record, ...create });
-      } else if (collection === ids.AppBskyGraphFollow && isFollow(record)) {
-        opsByType.follows.creates.push({ record, ...create });
-      }
+    handleEvent?(event: FirehoseEvent): void;
+
+    constructor(args?: FirehoseArgs) {
+        this._service = args?.service ?? FEEDGEN_SUBSCRIPTION_ENDPOINT;
+        this._reconnectDelayMs = args?.reconnectDelayMs ?? DEFAULT_SUBSCRIPTION_RECONNECT_DELAY;
+        this._cursor = args?.cursor;
+
+        this._sub = new Subscription({
+            service: this._service,
+            method: ids.ComAtprotoSyncSubscribeRepos,
+            getParams: () => this.getCursor(),
+            validate: (value: unknown) => {
+                try {
+                    return lexicons.assertValidXrpcMessage<RepoOp>(
+                        ids.ComAtprotoSyncSubscribeRepos,
+                        value
+                    );
+                } catch (err) {
+                    console.error("repo subscription skipped invalid message", err);
+                }
+            },
+        });
     }
 
-    if (op.action === "delete") {
-      if (collection === ids.AppBskyFeedPost) {
-        opsByType.posts.deletes.push({ uri });
-      } else if (collection === ids.AppBskyFeedRepost) {
-        opsByType.reposts.deletes.push({ uri });
-      } else if (collection === ids.AppBskyFeedLike) {
-        opsByType.likes.deletes.push({ uri });
-      } else if (collection === ids.AppBskyGraphFollow) {
-        opsByType.follows.deletes.push({ uri });
-      }
+    async run() {
+        this._stop = false;
+        while (!this._stop) {
+            try {
+                for await (const evt of this._sub) {
+                    if (this._stop) break;
+
+                    try {
+                        if (!isCommit(evt)) continue;
+                        if (evt.seq % 20 === 0) {
+                            this.updateCursor(evt.seq);
+                        }
+
+                        const car = await readCar(evt.blocks);
+
+                        for (const op of evt.ops) {
+                            const authorDid = evt.repo;
+
+                            if (op.cid == null) {
+                                this.handleEvent?.({ evt, op });
+                                continue;
+                            }
+                            const recordBytes = car.blocks.get(op.cid);
+
+                            if (recordBytes == null) {
+                                this.handleEvent({ evt, op });
+
+                                continue;
+                            }
+
+                            const record = cborToLexRecord(recordBytes);
+
+                            this.handleEvent?.({ evt, op, record });
+                        }
+                    } catch (err) {
+                        console.error("repo subscription could not handle message", err);
+                    }
+                }
+            } catch (err) {
+                console.error("repo subscription failed", err);
+                await delayMs(this._reconnectDelayMs);
+            }
+        }
     }
-  }
 
-  return opsByType;
-};
-
-export const isPost = (obj: unknown): obj is PostRecord => {
-  return isType(obj, ids.AppBskyFeedPost);
-};
-
-export const isRepost = (obj: unknown): obj is RepostRecord => {
-  return isType(obj, ids.AppBskyFeedRepost);
-};
-
-export const isLike = (obj: unknown): obj is LikeRecord => {
-  return isType(obj, ids.AppBskyFeedLike);
-};
-
-export const isFollow = (obj: unknown): obj is FollowRecord => {
-  return isType(obj, ids.AppBskyGraphFollow);
-};
-
-const isType = (obj: unknown, nsid: string) => {
-  try {
-    lexicons.assertValidRecord(nsid, fixBlobRefs(obj));
-    return true;
-  } catch (err) {
-    return false;
-  }
-};
-
-// @TODO right now record validation fails on BlobRefs
-// simply because multiple packages have their own copy
-// of the BlobRef class, causing instanceof checks to fail.
-// This is a temporary solution.
-const fixBlobRefs = (obj: unknown): unknown => {
-  if (Array.isArray(obj)) {
-    return obj.map(fixBlobRefs);
-  }
-  if (obj && typeof obj === "object") {
-    if (obj.constructor.name === "BlobRef") {
-      const blob = obj as BlobRef;
-      return new BlobRef(blob.ref, blob.mimeType, blob.size, blob.original);
+    stop() {
+        this._stop = true;
     }
-    return Object.entries(obj).reduce((acc, [key, val]) => {
-      return Object.assign(acc, { [key]: fixBlobRefs(val) });
-    }, {} as Record<string, unknown>);
-  }
-  return obj;
-};
+
+    async updateCursor(cursor: number) {
+        this._cursor = cursor;
+    }
+
+    async getCursor(): Promise<{ cursor?: number }> {
+        if (this._cursor == null) {
+            return {};
+        }
+
+        return { cursor: this._cursor };
+    }
+}
